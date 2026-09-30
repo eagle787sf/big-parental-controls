@@ -1,0 +1,28 @@
+#!/usr/bin/make -f
+# Build with a toolchain from rustup when the distro cargo is too old
+# (zbus needs Rust >= 1.87): `rustup default stable` before building.
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) build
+
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/big-parental-controls DISTRO=debian
+
+override_dh_auto_test:
+	cd big-age-signal && cargo test --release
+
+override_dh_auto_clean:
+	rm -rf big-age-signal/target
+
+# The daemon is enabled by pkg-post-install (postinst)
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+# big-age-signal.service is the legacy per-user unit; D-Bus activates it on demand
+override_dh_installsystemduser:
+	dh_installsystemduser --no-enable

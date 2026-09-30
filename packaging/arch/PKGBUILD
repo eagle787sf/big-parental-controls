@@ -1,0 +1,45 @@
+# Arch Linux / CachyOS / EndeavourOS / Manjaro package built from this checkout.
+# (pkgbuild/PKGBUILD is the BigLinux package, which builds from upstream git.)
+#
+#   cd packaging/arch && makepkg -si
+
+pkgname=big-parental-controls
+pkgver=1.0.0
+pkgrel=1
+arch=('x86_64')
+license=('GPL-3.0-or-later')
+url="https://github.com/biglinux/big-parental-controls"
+pkgdesc="Parental controls and supervised accounts"
+depends=(
+    'python'
+    'python-gobject'
+    'python-cairo'
+    'gtk4'
+    'libadwaita'
+    'malcontent'
+    'accountsservice'
+    'polkit'
+    'gettext'
+    'acl'
+    'libnotify'
+)
+makedepends=('rust' 'cargo' 'make')
+optdepends=(
+    'nftables: DNS redirect enforcement per supervised user (recommended)'
+)
+install=big-parental-controls.install
+
+_srcroot="$(realpath "$startdir/../..")"
+
+build() {
+    make -C "$_srcroot" build
+}
+
+check() {
+    cd "$_srcroot/big-age-signal"
+    cargo test --release
+}
+
+package() {
+    make -C "$_srcroot" install DESTDIR="$pkgdir" DISTRO=arch
+}

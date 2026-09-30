@@ -1,0 +1,22 @@
+#!/bin/bash
+# Package post-install/upgrade step shared by the deb and rpm packages.
+# (The Arch package keeps its own pkgbuild/big-parental-controls.install.)
+
+# Create supervised accounts group (sysusers.d also creates it at boot,
+# which is what image-based systems such as Fedora Atomic/Bazzite rely on)
+if command -v systemd-sysusers &>/dev/null; then
+    systemd-sysusers big-parental-controls.conf 2>/dev/null || true
+fi
+getent group supervised &>/dev/null || groupadd -r supervised 2>/dev/null || true
+
+# Only touch services on a running systemd system (not inside rpm-ostree
+# composes, image builds or chroots)
+if [[ -d /run/systemd/system ]]; then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reload dbus.service 2>/dev/null || systemctl reload dbus-broker.service 2>/dev/null || true
+    # Enable the daemon (handles activity monitoring, time and program enforcement)
+    systemctl enable --now big-parental-daemon.service 2>/dev/null || true
+else
+    systemctl enable big-parental-daemon.service 2>/dev/null || true
+fi
+exit 0

@@ -1,0 +1,36 @@
+Source: big-parental-controls
+Section: admin
+Priority: optional
+Maintainer: BigLinux <dev@biglinux.com.br>
+Build-Depends: debhelper-compat (= 13),
+               cargo (>= 1.87) | rustup,
+               pkgconf | pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/biglinux/big-parental-controls
+Rules-Requires-Root: no
+
+Package: big-parental-controls
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         python3 (>= 3.11),
+         python3-gi,
+         python3-gi-cairo,
+         gir1.2-gtk-4.0,
+         gir1.2-adw-1,
+         gir1.2-accountsservice-1.0,
+         gir1.2-malcontent-0,
+         malcontent,
+         accountsservice,
+         polkitd,
+         pkexec,
+         acl,
+         libnotify-bin,
+         passwd,
+         util-linux,
+         gettext-base
+Recommends: nftables, wtmpdb
+Description: Parental controls and supervised accounts
+ Native Linux parental controls suite: supervised child accounts, app
+ restrictions, screen time limits, DNS-based web filtering and local-only
+ activity monitoring. Uses AccountsService, malcontent, polkit, ACLs and
+ nftables. GTK4 + libadwaita interface with a Rust D-Bus daemon.

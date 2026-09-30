@@ -1,0 +1,2 @@
+// Re-apply parental control ACLs after dpkg replaces binaries (Debian/Ubuntu)
+DPkg::Post-Invoke { "if [ -x /usr/lib/big-parental-controls/acl-reapply ]; then /usr/lib/big-parental-controls/acl-reapply >/dev/null || true; fi"; };

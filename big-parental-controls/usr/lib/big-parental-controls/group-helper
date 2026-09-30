@@ -26,6 +26,157 @@ get_home() {
     getent passwd "$1" | cut -d: -f6
 }
 
+# Distro family: arch (BigLinux, Manjaro, CachyOS), fedora (incl. Atomic/Bazzite),
+# debian (Ubuntu) or unknown.
+detect_family() {
+    local ids=""
+    if [[ -r /etc/os-release ]]; then
+        ids=$(. /etc/os-release; echo "${ID:-} ${ID_LIKE:-}")
+    elif [[ -r /usr/lib/os-release ]]; then
+        ids=$(. /usr/lib/os-release; echo "${ID:-} ${ID_LIKE:-}")
+    fi
+    for id in ${ids,,}; do
+        case "$id" in
+            arch|archlinux|manjaro|biglinux|cachyos|endeavouros) echo arch; return ;;
+            fedora|rhel|centos|bazzite|bluefin|aurora) echo fedora; return ;;
+            debian|ubuntu) echo debian; return ;;
+        esac
+    done
+    echo unknown
+}
+
+# Image-based systems (Fedora Atomic, Bazzite…) have a read-only /usr where
+# ACLs cannot be set; blocked programs are then enforced by the daemon.
+is_immutable() {
+    [[ -e /run/ostree-booted ]] && return 0
+    findmnt -no OPTIONS -T /usr 2>/dev/null | tr ',' '\n' | grep -qx ro
+}
+
+# Default programs blocked for supervised accounts (keep in sync with core/distro.py)
+default_blocks() {
+    local arch_blocks=(
+        /usr/bin/pacman /usr/bin/pamac-manager /usr/bin/pamac-installer
+        /usr/bin/pamac-daemon /usr/bin/yay /usr/bin/paru /usr/bin/octopi
+        /usr/bin/cachyos-pi
+    )
+    local fedora_blocks=(
+        /usr/bin/dnf /usr/bin/dnf5 /usr/bin/dnf-3 /usr/bin/yum /usr/bin/rpm-ostree
+        /usr/bin/ujust /usr/bin/ujust-picker /usr/bin/distrobox /usr/bin/toolbox
+        /usr/bin/podman
+    )
+    local debian_blocks=(
+        /usr/bin/apt /usr/bin/apt-get /usr/bin/aptitude /usr/bin/dpkg
+        /usr/bin/nala /usr/bin/snap-store
+    )
+    local common_blocks=(/usr/bin/flatpak /usr/bin/snap /usr/bin/ssh /usr/bin/rustdesk)
+    case "$(detect_family)" in
+        arch) printf '%s\n' "${arch_blocks[@]}" ;;
+        fedora) printf '%s\n' "${fedora_blocks[@]}" ;;
+        debian) printf '%s\n' "${debian_blocks[@]}" ;;
+        *) printf '%s\n' "${arch_blocks[@]}" "${fedora_blocks[@]}" "${debian_blocks[@]}" ;;
+    esac
+    # Most desktop apps are Flatpaks on image-based systems, so the flatpak binary
+    # must stay usable there; installs are denied by the malcontent app filter.
+    if is_immutable; then
+        common_blocks=("${common_blocks[@]/\/usr\/bin\/flatpak}")
+    fi
+    local path
+    for path in "${common_blocks[@]}"; do
+        [[ -n "$path" ]] && echo "$path"
+    done
+    return 0
+}
+
+# Deny execution of PATH for USERNAME. Fails silently where ACLs are unsupported
+# (read-only /usr); the path is still recorded in the state file for the daemon.
+block_path() {
+    setfacl -m "u:$1:---" "$2" 2>/dev/null || true
+}
+
+# systemd mount unit name for a home directory (e.g. /var/home/kid -> var-home-kid.mount)
+home_mount_unit() {
+    [[ -n "$1" ]] && systemd-escape --path --suffix=mount "$1" 2>/dev/null
+}
+
+# Hide .desktop entries whose Exec references BINARY_PATH for USERNAME
+hide_desktop_entries() {
+    local username="$1" path="$2" apps_dir="$3" binary desktop
+    binary=$(basename "$path")
+    for desktop in /usr/share/applications/*.desktop /var/lib/flatpak/exports/share/applications/*.desktop; do
+        [[ -f "$desktop" ]] || continue
+        if grep -q "Exec=.*${binary}" "$desktop" 2>/dev/null; then
+            cat > "$apps_dir/$(basename "$desktop")" << DEOF
+[Desktop Entry]
+NoDisplay=true
+DEOF
+            chown "${username}:" "$apps_dir/$(basename "$desktop")"
+        fi
+    done
+}
+
+enable_tmp_noexec() {
+    mkdir -p /etc/systemd/system/tmp.mount.d
+    cat > /etc/systemd/system/tmp.mount.d/big-parental-noexec.conf << TEOF
+[Mount]
+Options=mode=1777,strictatime,noexec,nosuid,nodev
+TEOF
+    mkdir -p /etc/systemd/system/dev-shm.mount.d
+    cat > /etc/systemd/system/dev-shm.mount.d/big-parental-noexec.conf << SEOF
+[Mount]
+Options=nosuid,noexec,nodev
+SEOF
+    systemctl daemon-reload
+    # Immediate remount for current session
+    mount -o remount,noexec,nosuid,nodev /tmp 2>/dev/null || true
+    mount -o remount,noexec,nosuid,nodev /dev/shm 2>/dev/null || true
+}
+
+# Add USERNAME to the supervised group and apply all default enforcement
+apply_default_enforcement() {
+    local username="$1" path current home_dir apps_dir
+    local blocks=()
+
+    groupadd -r "$GROUP" 2>/dev/null || true
+    usermod -aG "$GROUP" "$username"
+
+    # Apply default blocks
+    mapfile -t blocks < <(default_blocks)
+    for path in "${blocks[@]}"; do
+        [[ -e "$path" ]] && block_path "$username" "$path"
+    done
+
+    # Save block state (read by acl-reapply and by the daemon)
+    if [[ -f "$ACL_STATE" ]]; then
+        current=$(cat "$ACL_STATE")
+    else
+        current="{}"
+    fi
+    BPC_STATE="$current" BPC_USER="$username" BPC_BLOCKS="$(printf '%s\n' "${blocks[@]}")" python3 -c '
+import json, os
+state = json.loads(os.environ["BPC_STATE"])
+blocks = [p for p in os.environ["BPC_BLOCKS"].split("\n") if p and os.path.exists(p)]
+state[os.environ["BPC_USER"]] = blocks
+print(json.dumps(state, indent=2))
+' > "$ACL_STATE.tmp" 2>/dev/null && mv -f "$ACL_STATE.tmp" "$ACL_STATE" || rm -f "$ACL_STATE.tmp"
+    chmod 644 "$ACL_STATE" 2>/dev/null || true
+
+    home_dir=$(get_home "$username")
+
+    # Hide blocked apps from desktop menu
+    apps_dir="$home_dir/.local/share/applications"
+    mkdir -p "$apps_dir"
+    chown "${username}:" "$home_dir/.local" "$home_dir/.local/share" "$apps_dir" 2>/dev/null || true
+    for path in "${blocks[@]}"; do
+        [[ -e "$path" ]] || continue
+        hide_desktop_entries "$username" "$path" "$apps_dir"
+    done
+
+    enable_tmp_noexec
+
+    # The daemon enforces time limits and (on immutable systems) blocked programs
+    systemctl enable --now big-parental-daemon.service 2>/dev/null || true
+}
+
 case "$1" in
     add)
         [[ -z "$2" ]] && exit 1
@@ -54,78 +205,7 @@ case "$1" in
         useradd -m -c "$FULLNAME" -s /bin/bash "$USERNAME" || exit 1
         printf '%s:%s' "$USERNAME" "$PASSWORD" | chpasswd || exit 1
 
-        # Add to supervised group
-        groupadd -r "$GROUP" 2>/dev/null || true
-        usermod -aG "$GROUP" "$USERNAME"
-
-        # Apply default ACL blocks
-        DEFAULT_BLOCKS=(
-            /usr/bin/pacman
-            /usr/bin/pamac-manager
-            /usr/bin/pamac-installer
-            /usr/bin/pamac-daemon
-            /usr/bin/yay
-            /usr/bin/paru
-            /usr/bin/flatpak
-            /usr/bin/snap
-            /usr/bin/ssh
-            /usr/bin/rustdesk
-        )
-        for path in "${DEFAULT_BLOCKS[@]}"; do
-            [[ -e "$path" ]] && setfacl -m "u:${USERNAME}:---" "$path" 2>/dev/null || true
-        done
-
-        # Save ACL state
-        if [[ -f "$ACL_STATE" ]]; then
-            CURRENT=$(cat "$ACL_STATE")
-        else
-            CURRENT="{}"
-        fi
-        BPC_STATE="$CURRENT" BPC_USER="$USERNAME" python3 -c '
-import json, os
-state = json.loads(os.environ["BPC_STATE"])
-blocks = [p for p in ["/usr/bin/pacman","/usr/bin/pamac-manager","/usr/bin/pamac-installer","/usr/bin/pamac-daemon","/usr/bin/yay","/usr/bin/paru","/usr/bin/flatpak","/usr/bin/snap","/usr/bin/ssh","/usr/bin/rustdesk"] if os.path.exists(p)]
-state[os.environ["BPC_USER"]] = blocks
-print(json.dumps(state, indent=2))
-' > "$ACL_STATE" 2>/dev/null || true
-        chmod 644 "$ACL_STATE"
-
-        HOME_DIR=$(get_home "$USERNAME")
-
-        # Hide blocked apps from desktop menu
-        APPS_DIR="$HOME_DIR/.local/share/applications"
-        mkdir -p "$APPS_DIR"
-        for path in "${DEFAULT_BLOCKS[@]}"; do
-            [[ -e "$path" ]] || continue
-            BINARY=$(basename "$path")
-            # Find .desktop files that reference this binary
-            for desktop in /usr/share/applications/*.desktop; do
-                [[ -f "$desktop" ]] || continue
-                if grep -q "Exec=.*${BINARY}" "$desktop" 2>/dev/null; then
-                    DESKTOP_NAME=$(basename "$desktop")
-                    cat > "$APPS_DIR/$DESKTOP_NAME" << DEOF
-[Desktop Entry]
-NoDisplay=true
-DEOF
-                    chown "${USERNAME}:${USERNAME}" "$APPS_DIR/$DESKTOP_NAME"
-                fi
-            done
-        done
-
-        # Enable noexec on /tmp and /dev/shm
-        mkdir -p /etc/systemd/system/tmp.mount.d
-        cat > /etc/systemd/system/tmp.mount.d/big-parental-noexec.conf << TEOF
-[Mount]
-Options=mode=1777,strictatime,noexec,nosuid,nodev
-TEOF
-        mkdir -p /etc/systemd/system/dev-shm.mount.d
-        cat > /etc/systemd/system/dev-shm.mount.d/big-parental-noexec.conf << SEOF
-[Mount]
-Options=nosuid,noexec,nodev
-SEOF
-        systemctl daemon-reload
-        mount -o remount,noexec,nosuid,nodev /tmp 2>/dev/null || true
-        mount -o remount,noexec,nosuid,nodev /dev/shm 2>/dev/null || true
+        apply_default_enforcement "$USERNAME"
         ;;
     remove)
         [[ -z "$2" ]] && exit 1
@@ -138,86 +218,15 @@ SEOF
         # Used for existing users being made supervised
         [[ -z "$2" ]] && exit 1
         validate_username "$2"
-        USERNAME="$2"
-
-        # Add to supervised group
-        groupadd -r "$GROUP" 2>/dev/null || true
-        usermod -aG "$GROUP" "$USERNAME"
-
-        # Apply default ACL blocks
-        DEFAULT_BLOCKS=(
-            /usr/bin/pacman
-            /usr/bin/pamac-manager
-            /usr/bin/pamac-installer
-            /usr/bin/pamac-daemon
-            /usr/bin/yay
-            /usr/bin/paru
-            /usr/bin/flatpak
-            /usr/bin/snap
-            /usr/bin/ssh
-            /usr/bin/rustdesk
-        )
-        for path in "${DEFAULT_BLOCKS[@]}"; do
-            [[ -e "$path" ]] && setfacl -m "u:${USERNAME}:---" "$path" 2>/dev/null || true
-        done
-
-        # Save ACL state
-        if [[ -f "$ACL_STATE" ]]; then
-            CURRENT=$(cat "$ACL_STATE")
-        else
-            CURRENT="{}"
-        fi
-        BPC_STATE="$CURRENT" BPC_USER="$USERNAME" python3 -c '
-import json, os
-state = json.loads(os.environ["BPC_STATE"])
-blocks = [p for p in ["/usr/bin/pacman","/usr/bin/pamac-manager","/usr/bin/pamac-installer","/usr/bin/pamac-daemon","/usr/bin/yay","/usr/bin/paru","/usr/bin/flatpak","/usr/bin/snap","/usr/bin/ssh","/usr/bin/rustdesk"] if os.path.exists(p)]
-state[os.environ["BPC_USER"]] = blocks
-print(json.dumps(state, indent=2))
-' > "$ACL_STATE" 2>/dev/null || true
-        chmod 644 "$ACL_STATE"
-
-        HOME_DIR=$(get_home "$USERNAME")
-
-        # Hide blocked apps from desktop menu
-        APPS_DIR="$HOME_DIR/.local/share/applications"
-        mkdir -p "$APPS_DIR"
-        for path in "${DEFAULT_BLOCKS[@]}"; do
-            [[ -e "$path" ]] || continue
-            BINARY=$(basename "$path")
-            for desktop in /usr/share/applications/*.desktop; do
-                [[ -f "$desktop" ]] || continue
-                if grep -q "Exec=.*${BINARY}" "$desktop" 2>/dev/null; then
-                    DESKTOP_NAME=$(basename "$desktop")
-                    cat > "$APPS_DIR/$DESKTOP_NAME" << DEOF
-[Desktop Entry]
-NoDisplay=true
-DEOF
-                    chown "${USERNAME}:${USERNAME}" "$APPS_DIR/$DESKTOP_NAME"
-                fi
-            done
-        done
-
-        # Enable noexec on /tmp and /dev/shm
-        mkdir -p /etc/systemd/system/tmp.mount.d
-        cat > /etc/systemd/system/tmp.mount.d/big-parental-noexec.conf << TEOF
-[Mount]
-Options=mode=1777,strictatime,noexec,nosuid,nodev
-TEOF
-        mkdir -p /etc/systemd/system/dev-shm.mount.d
-        cat > /etc/systemd/system/dev-shm.mount.d/big-parental-noexec.conf << SEOF
-[Mount]
-Options=nosuid,noexec,nodev
-SEOF
-        systemctl daemon-reload
-        mount -o remount,noexec,nosuid,nodev /tmp 2>/dev/null || true
-        mount -o remount,noexec,nosuid,nodev /dev/shm 2>/dev/null || true
+        apply_default_enforcement "$2"
         ;;
     acl-apply)
         # Usage: acl-apply USERNAME PATH
         [[ -z "$2" || -z "$3" ]] && exit 1
         validate_username "$2"
         validate_path "$3"
-        setfacl -m "u:$2:---" "$3"
+        # On read-only /usr the block is enforced by the daemon from the state file
+        setfacl -m "u:$2:---" "$3" || is_immutable
         ;;
     acl-remove)
         # Usage: acl-remove USERNAME PATH
@@ -235,8 +244,10 @@ SEOF
         chmod 644 "$ACL_STATE"
         ;;
     acl-reapply)
-        # Re-apply all ACLs from state file (used by pacman hook)
+        # Re-apply all ACLs from state file (used by pacman hook, apt hook and rpm trigger)
         [[ -f "$ACL_STATE" ]] || exit 0
+        # Read-only /usr (Fedora Atomic, Bazzite): the daemon enforces blocks instead
+        is_immutable && exit 0
         BPC_ACL_FILE="$ACL_STATE" python3 -c '
 import json, subprocess, os, sys
 
@@ -317,8 +328,9 @@ EOF
         validate_username "$2"
         HOME_DIR=$(get_home "$2")
         [[ -d "$HOME_DIR" ]] || exit 1
-        # Escape path for systemd unit name: replace / with -
-        UNIT_NAME="home-${2}.mount"
+        # Resolve symlinks (/home -> /var/home on Fedora Atomic) and escape for systemd
+        HOME_DIR=$(readlink -f "$HOME_DIR")
+        UNIT_NAME=$(home_mount_unit "$HOME_DIR")
         cat > "/etc/systemd/system/$UNIT_NAME" << EOF
 [Unit]
 Description=Noexec mount for supervised user $2
@@ -340,27 +352,17 @@ EOF
         # Usage: noexec-disable USERNAME
         [[ -z "$2" ]] && exit 1
         validate_username "$2"
-        UNIT_NAME="home-${2}.mount"
-        systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
-        rm -f "/etc/systemd/system/$UNIT_NAME"
+        HOME_DIR=$(readlink -f "$(get_home "$2")")
+        for UNIT_NAME in "$(home_mount_unit "$HOME_DIR")" "home-${2}.mount"; do
+            [[ -n "$UNIT_NAME" ]] || continue
+            systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
+            rm -f "/etc/systemd/system/$UNIT_NAME"
+        done
         systemctl daemon-reload
         ;;
     noexec-tmp-enable)
         # Enable noexec on /tmp and /dev/shm via systemd drop-in + immediate remount
-        mkdir -p /etc/systemd/system/tmp.mount.d
-        cat > /etc/systemd/system/tmp.mount.d/big-parental-noexec.conf << EOF
-[Mount]
-Options=mode=1777,strictatime,noexec,nosuid,nodev
-EOF
-        mkdir -p /etc/systemd/system/dev-shm.mount.d
-        cat > /etc/systemd/system/dev-shm.mount.d/big-parental-noexec.conf << EOF
-[Mount]
-Options=nosuid,noexec,nodev
-EOF
-        systemctl daemon-reload
-        # Immediate remount for current session
-        mount -o remount,noexec,nosuid,nodev /tmp 2>/dev/null || true
-        mount -o remount,noexec,nosuid,nodev /dev/shm 2>/dev/null || true
+        enable_tmp_noexec
         ;;
     noexec-tmp-disable)
         # Remove noexec drop-ins for /tmp and /dev/shm + immediate remount
@@ -379,6 +381,7 @@ EOF
         [[ -z "$2" || -z "$3" ]] && exit 1
         validate_username "$2"
         CONF="/etc/security/time.conf"
+        touch "$CONF"
         # Remove existing entry for this user
         sed -i "/^\\*;\\*;$2;/d" "$CONF"
         # Add new entry
@@ -389,6 +392,7 @@ EOF
         [[ -z "$2" ]] && exit 1
         validate_username "$2"
         CONF="/etc/security/time.conf"
+        [[ -f "$CONF" ]] || exit 0
         sed -i "/^\\*;\\*;$2;/d" "$CONF"
         ;;
     time-limit-save)
@@ -471,9 +475,11 @@ with open(limits_file, "w") as f:
         gpasswd -d "$USERNAME" "$GROUP" 2>/dev/null || true
 
         # 7. Disable noexec on user home
-        UNIT_NAME="home-${USERNAME}.mount"
-        systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
-        rm -f "/etc/systemd/system/$UNIT_NAME"
+        for UNIT_NAME in "$(home_mount_unit "$(readlink -f "$HOME_DIR")")" "home-${USERNAME}.mount"; do
+            [[ -n "$UNIT_NAME" ]] || continue
+            systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
+            rm -f "/etc/systemd/system/$UNIT_NAME"
+        done
 
         # 8. Check if any supervised users remain
         if getent group "$GROUP" &>/dev/null; then
@@ -711,7 +717,9 @@ print(json.dumps(state, indent=2))
             echo "Invalid days parameter (1-365)" >&2
             exit 1
         fi
-        last -n 10000 "$2" --time-format iso 2>/dev/null
+        # Distros without /var/log/wtmp (newer Debian/Ubuntu, Fedora) use wtmpdb
+        last -n 10000 "$2" --time-format iso 2>/dev/null \
+            || wtmpdb last -n 10000 "$2" --time-format iso 2>/dev/null
         ;;
     activity-ensure-dirs)
         # Usage: activity-ensure-dirs USERNAME
