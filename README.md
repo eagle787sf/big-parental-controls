@@ -187,9 +187,16 @@ When a parent opens a supervised user, the page shows (in order):
 
 ## Default App Blocks
 
-When a supervised account is created, the following binaries are blocked via ACL:
+When a supervised account is created, package managers and remote-access tools for the running distribution are blocked (paths that do not exist are skipped):
 
-`pacman`, `pamac-manager`, `pamac-installer`, `pamac-daemon`, `yay`, `paru`, `flatpak`, `snap`, `ssh`, `rustdesk`
+| Distribution | Blocked by default |
+|---|---|
+| BigLinux, Manjaro, CachyOS, Arch | `pacman`, `pamac-*`, `yay`, `paru`, `octopi`, `cachyos-pi` |
+| Fedora, Fedora Atomic, Bazzite | `dnf`, `dnf5`, `yum`, `rpm-ostree`, `ujust`, `distrobox`, `toolbox`, `podman` |
+| Ubuntu, Debian | `apt`, `apt-get`, `aptitude`, `dpkg`, `nala`, `snap-store` |
+| All | `flatpak`\*, `snap`, `ssh`, `rustdesk` |
+
+\* On image-based systems (Fedora Atomic, Bazzite) most desktop apps are Flatpaks, so `flatpak` itself stays usable there; Flatpak installs are still denied by the malcontent app filter.
 
 The parent can adjust this list from the app's filter page.
 
@@ -199,33 +206,108 @@ The parent can adjust this list from the app's filter page.
 - Age-range data is stored locally in `/var/lib/big-parental-controls/user-profiles.json`, written only by the privileged helper.
 - The D-Bus policy allows `GetAgeGroup` queries from all users on the local system bus.
 
+## Supported Distributions
+
+| Distribution | Package | How programs are blocked |
+|---|---|---|
+| BigLinux, Manjaro | `pkgbuild/PKGBUILD` | ACLs, re-applied by a pacman hook |
+| CachyOS, Arch, EndeavourOS | `packaging/arch/PKGBUILD` | ACLs, re-applied by a pacman hook |
+| Ubuntu 24.04+, Debian 13+ | `debian/` (`.deb`) | ACLs, re-applied by an apt hook |
+| Fedora Workstation / KDE | `packaging/fedora/` (`.rpm`) | ACLs, re-applied by an RPM file trigger |
+| Fedora Atomic (Silverblue, Kinoite), Bazzite, Bluefin, Aurora | same `.rpm`, layered with `rpm-ostree` | `/usr` is read-only, so the daemon terminates blocked programs |
+
+What changes per distribution:
+
+- **Package managers** — the default block list and the polkit rules cover pacman/pamac, dnf/dnf5, rpm-ostree, apt/dpkg, snapd, Flatpak and PackageKit.
+- **Administrators** — the D-Bus policy accepts `wheel` (Arch, Fedora) and `sudo` (Ubuntu) group members.
+- **Home directories** — `/var/home` (Fedora Atomic, Bazzite) is supported for the noexec home mount.
+- **Login history** — falls back to `wtmpdb last` on systems without `/var/log/wtmp`.
+- **Group creation** — a `sysusers.d` file creates the `supervised` group at boot, which image-based systems need.
+
+Ubuntu 22.04 and older are not supported: their polkit ignores JavaScript rules files.
+
 ## Dependencies
 
 Runtime:
 
-- Python 3.14+, PyGObject, GTK4, libadwaita
+- Python 3.11+, PyGObject, GTK4, libadwaita
 - malcontent, AccountsService, polkit
 - nftables, ACL tools (`setfacl`/`getfacl`)
-- gettext
+- gettext, libnotify (`notify-send`)
 
 Build:
 
-- Rust, Cargo
+- Rust 1.87+ and Cargo, make
 
-See `pkgbuild/PKGBUILD` for the full list.
+See `debian/control`, `packaging/fedora/big-parental-controls.spec` and `packaging/arch/PKGBUILD` for the per-distribution package names.
 
 ## Build and Install
 
-### Package Build (recommended)
+Several features depend on installed paths, polkit policies, systemd services, and helper scripts — running from source alone is not enough for full functionality. Always install a package.
+
+### BigLinux / Manjaro
 
 ```bash
 cd pkgbuild
 makepkg -si
 ```
 
-Several features depend on installed paths, polkit policies, systemd services, and helper scripts — running from source alone is not enough for full functionality.
+### CachyOS / Arch Linux
 
-### Rust Service
+Builds from this checkout (the BigLinux PKGBUILD downloads upstream sources instead):
+
+```bash
+cd packaging/arch
+makepkg -si
+```
+
+### Ubuntu / Debian
+
+Ubuntu 24.04's `cargo` is too old for the daemon, so install Rust with [rustup](https://rustup.rs) first:
+
+```bash
+sudo apt install build-essential debhelper pkg-config
+curl -sSf https://sh.rustup.rs | sh        # then open a new shell
+dpkg-buildpackage -us -uc -b -d            # or: make deb
+sudo apt install ../big-parental-controls_*.deb
+```
+
+### Fedora Workstation / KDE
+
+```bash
+sudo dnf install git rpm-build make cargo rust systemd-rpm-macros
+packaging/fedora/build-rpm.sh              # or: make rpm (builds the committed HEAD)
+sudo dnf install dist/big-parental-controls-*.rpm
+```
+
+### Fedora Atomic / Bazzite / Bluefin / Aurora
+
+`/usr` is read-only, so build the RPM in a toolbox and layer it onto the system image:
+
+```bash
+toolbox create && toolbox enter             # or use distrobox with a Fedora image
+sudo dnf install git rpm-build make cargo rust systemd-rpm-macros
+packaging/fedora/build-rpm.sh
+exit
+
+sudo rpm-ostree install dist/big-parental-controls-*.rpm
+systemctl reboot
+```
+
+After the reboot, run `sudo systemctl enable --now big-parental-daemon` once if the daemon is not running (the app also starts it when the first supervised account is created).
+
+For a custom image (BlueBuild, uBlue `Containerfile`), copy the RPM into the build and install it:
+
+```dockerfile
+COPY big-parental-controls-*.rpm /tmp/
+RUN rpm-ostree install /tmp/big-parental-controls-*.rpm && \
+    systemctl enable big-parental-daemon.service && \
+    ostree container commit
+```
+
+On these systems the filesystem cannot carry ACLs, so blocked programs are enforced by `big-parental-daemon`, which terminates them within about two seconds of being started by a supervised user. Everything else (time limits, schedules, web filter, malcontent app filter, polkit restrictions) works the same way as on other distributions.
+
+### Rust Service Only
 
 ```bash
 cd big-age-signal

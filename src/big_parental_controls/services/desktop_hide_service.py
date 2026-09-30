@@ -26,7 +26,8 @@ def _get_user_apps_dir(username: str) -> str:
         )
         home = result.stdout.strip().split(":")[5]
     except (subprocess.CalledProcessError, IndexError):
-        home = f"/home/{username}"
+        # /home may be a symlink to /var/home (Fedora Atomic, Bazzite)
+        home = os.path.expanduser(f"~{username}")
     return os.path.join(home, ".local", "share", "applications")
 
 

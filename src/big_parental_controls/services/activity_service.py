@@ -202,26 +202,25 @@ class ActivityService:
         since_dt = datetime.now() - timedelta(days=days)
         since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
-        try:
-            result = subprocess.run(
-                [
-                    "last",
-                    "-n",
-                    "10000",
-                    username,
-                    "--time-format",
-                    "iso",
-                    "--since",
-                    since_str,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            return []
+        args = ["-n", "10000", username, "--time-format", "iso", "--since", since_str]
+        result = None
+        # util-linux `last` reads /var/log/wtmp; distros that dropped wtmp
+        # (newer Debian/Ubuntu, Fedora) ship `wtmpdb last` with the same syntax.
+        for cmd in (["last"], ["wtmpdb", "last"]):
+            try:
+                result = subprocess.run(
+                    cmd + args,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                result = None
+                continue
+            if result.returncode == 0:
+                break
 
-        if result.returncode != 0:
+        if result is None or result.returncode != 0:
             return []
 
         sessions: list[SessionEntry] = []

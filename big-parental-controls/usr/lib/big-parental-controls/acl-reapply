@@ -1,4 +1,6 @@
 #!/bin/bash
-# Re-apply parental control ACL restrictions after pacman transactions.
-# Called by the pacman hook big-parental-controls-acl.hook
+# Re-apply parental control ACL restrictions after package transactions
+# (package upgrades replace binaries and drop their ACLs).
+# Called by the pacman hook (Arch, CachyOS), the apt hook (Ubuntu) and the
+# rpm file trigger (Fedora).
 exec /usr/lib/big-parental-controls/group-helper acl-reapply

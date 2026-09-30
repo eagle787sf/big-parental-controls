@@ -1,0 +1,68 @@
+name: Distro packages
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  ubuntu-deb:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential debhelper curl ca-certificates pkg-config
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build .deb
+        run: |
+          dpkg-buildpackage -us -uc -b -d
+          mkdir -p dist && mv ../big-parental-controls_*.deb dist/
+      - name: Install .deb (resolves runtime dependencies)
+        run: apt-get install -y ./dist/big-parental-controls_*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: big-parental-controls-deb
+          path: dist/*.deb
+
+  fedora-rpm:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install build tools
+        run: dnf install -y git rpm-build make cargo rust systemd-rpm-macros
+      - uses: actions/checkout@v4
+      - name: Build .rpm
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          packaging/fedora/build-rpm.sh
+      - name: Install .rpm (resolves runtime dependencies)
+        run: dnf install -y dist/big-parental-controls-*.rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: big-parental-controls-rpm
+          path: dist/*.rpm
+
+  arch-pkg:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install build tools
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust sudo
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+      - uses: actions/checkout@v4
+      - name: Build package
+        run: |
+          chown -R builder "$GITHUB_WORKSPACE"
+          cd packaging/arch
+          sudo -u builder makepkg -s --noconfirm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: big-parental-controls-arch
+          path: packaging/arch/*.pkg.tar.zst

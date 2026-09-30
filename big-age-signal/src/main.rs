@@ -5,12 +5,18 @@
 //! - `br.com.biglinux.ParentalMonitor1` — process monitoring for supervised users
 //!
 //! Runs on the **system bus** so it can read /proc for any UID.
-//! Write methods (EnableUser/DisableUser) restricted to `wheel` group via D-Bus policy.
+//! Write methods (EnableUser/DisableUser) restricted to administrators
+//! (`wheel` or `sudo` group) via D-Bus policy.
+//!
+//! Also enforces blocked programs for supervised users. Normally this is done
+//! with filesystem ACLs, but on image-based systems (Fedora Atomic, Bazzite)
+//! `/usr` is read-only, so the daemon terminates blocked programs instead.
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -30,7 +36,9 @@ const MONITORED_FILE: &str = "/var/lib/big-parental-controls/monitored-users.jso
 const TIME_LIMITS_FILE: &str = "/var/lib/big-parental-controls/time-limits.json";
 const TIME_USAGE_FILE: &str = "/var/lib/big-parental-controls/time-state.json";
 const TIME_CONF_FILE: &str = "/etc/security/time.conf";
+const ACL_STATE_FILE: &str = "/var/lib/big-parental-controls/acl-blocks.json";
 const POLL_INTERVAL_SECS: u64 = 60;
+const BLOCK_POLL_INTERVAL_SECS: u64 = 2;
 
 /// Processes to ignore (system daemons, not user-facing apps).
 const IGNORED_PROCESSES: &[&str] = &[
@@ -573,8 +581,21 @@ fn terminate_session(username: &str, session_id: &str, reason: &str) {
 }
 
 fn notify_user(username: &str, summary: &str, body: &str) {
-    let _ = Command::new("sudo")
-        .args(["-u", username, "notify-send", "--urgency=critical", summary, body])
+    // Run notify-send directly as the user on their session bus. Avoids
+    // depending on sudo, whose configuration differs between distributions.
+    let Ok(Some(user)) = User::from_name(username) else {
+        return;
+    };
+    let uid = user.uid.as_raw();
+    let _ = Command::new("notify-send")
+        .args(["--urgency=critical", summary, body])
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("HOME", &user.dir)
+        .env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"))
+        .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path=/run/user/{uid}/bus"))
+        .gid(user.gid.as_raw())
+        .uid(uid)
         .output();
 }
 
@@ -770,6 +791,101 @@ fn enforce_time_limits() {
     }
 }
 
+// ── Blocked program enforcement ──────────────────────────────
+
+/// Load blocked program paths per supervised UID from the ACL state file.
+fn load_program_blocks() -> Vec<(u32, Vec<String>)> {
+    let Ok(content) = fs::read_to_string(ACL_STATE_FILE) else {
+        return Vec::new();
+    };
+    let Ok(state) = serde_json::from_str::<HashMap<String, Vec<String>>>(&content) else {
+        return Vec::new();
+    };
+    state
+        .into_iter()
+        .filter(|(_, paths)| !paths.is_empty())
+        .filter_map(|(username, paths)| {
+            let user = User::from_name(&username).ok()??;
+            // Only enforce for users that are still supervised
+            is_uid_supervised(user.uid).then(|| (user.uid.as_raw(), paths))
+        })
+        .collect()
+}
+
+/// Whether a process matches a blocked program path. Uses the executable
+/// link when readable, otherwise argv[0] and the kernel `comm` name (which
+/// for scripts is the script name, truncated to 15 bytes).
+fn process_matches(pid_path: &Path, blocked: &[String]) -> bool {
+    let exe = fs::read_link(pid_path.join("exe")).ok();
+    let argv0 = fs::read(pid_path.join("cmdline"))
+        .ok()
+        .and_then(|raw| {
+            raw.split(|b| *b == 0)
+                .next()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+        })
+        .unwrap_or_default();
+    let comm = fs::read_to_string(pid_path.join("comm")).unwrap_or_default();
+    let comm = comm.trim_end();
+    let argv0_base = argv0.rsplit('/').next().unwrap_or("");
+
+    blocked.iter().any(|path| {
+        let base = path.rsplit('/').next().unwrap_or(path);
+        if exe.as_deref() == Some(Path::new(path)) {
+            return true;
+        }
+        if !argv0.is_empty() && (argv0 == *path || argv0_base == base) {
+            return true;
+        }
+        let comm_base: String = base.chars().take(15).collect();
+        !comm.is_empty() && comm == comm_base
+    })
+}
+
+/// Terminate blocked programs started by supervised users.
+fn enforce_program_blocks() {
+    let blocks = load_program_blocks();
+    if blocks.is_empty() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
+            continue;
+        };
+        let pid_path = entry.path();
+        let Ok(status) = fs::read_to_string(pid_path.join("status")) else {
+            continue;
+        };
+        let Some(uid) = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|u| u.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some((_, paths)) = blocks.iter().find(|(u, _)| *u == uid) else {
+            continue;
+        };
+        if process_matches(&pid_path, paths) {
+            eprintln!("Blocked program terminated (pid {pid}, uid {uid})");
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+    }
+}
+
+async fn program_block_loop() {
+    let mut tick = interval(Duration::from_secs(BLOCK_POLL_INTERVAL_SECS));
+    loop {
+        tick.tick().await;
+        enforce_program_blocks();
+    }
+}
+
 // ── Monitor loop ─────────────────────────────────────────────
 
 async fn monitor_loop(state: Arc<Mutex<MonitorState>>) {
@@ -835,8 +951,50 @@ async fn main() -> Result<()> {
         monitor_loop(monitor_state).await;
     });
 
+    // Enforce blocked programs (the only enforcement where /usr is read-only)
+    tokio::spawn(program_block_loop());
+
     // Run forever — D-Bus messages handled by zbus in the background.
     std::future::pending::<()>().await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_proc(name: &str, cmdline: &[u8], comm: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bpc-test-{}-{name}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(dir.join("cmdline"), cmdline).unwrap();
+        fs::write(dir.join("comm"), format!("{comm}\n")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn matches_by_argv0_path_and_basename() {
+        let blocked = vec!["/usr/bin/rpm-ostree".to_string()];
+        let p = fake_proc("a", b"/usr/bin/rpm-ostree\0install\0foo\0", "rpm-ostree");
+        assert!(process_matches(&p, &blocked));
+        let p = fake_proc("b", b"rpm-ostree\0status\0", "rpm-ostree");
+        assert!(process_matches(&p, &blocked));
+    }
+
+    #[test]
+    fn matches_script_by_comm() {
+        // Shebang scripts: argv[0] is the interpreter, comm is the script name
+        let blocked = vec!["/usr/bin/ujust".to_string()];
+        let p = fake_proc("c", b"/bin/bash\0/usr/bin/ujust\0", "ujust");
+        assert!(process_matches(&p, &blocked));
+    }
+
+    #[test]
+    fn does_not_match_other_programs() {
+        let blocked = vec!["/usr/bin/apt".to_string(), "/usr/bin/ssh".to_string()];
+        let p = fake_proc("d", b"/usr/bin/firefox\0", "firefox");
+        assert!(!process_matches(&p, &blocked));
+        let p = fake_proc("e", b"/usr/bin/ssh-agent\0", "ssh-agent");
+        assert!(!process_matches(&p, &blocked));
+    }
 }

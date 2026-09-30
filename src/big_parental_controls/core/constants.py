@@ -2,6 +2,8 @@
 
 import os as _os
 
+from big_parental_controls.core.distro import default_blocks as _default_blocks
+
 APP_ID = "br.com.biglinux.ParentalControls"
 APP_NAME = "Big Parental Controls"
 APP_VERSION = "1.0.0"
@@ -74,18 +76,6 @@ DNS_PROVIDERS: dict[str, dict[str, str]] = {
     },
 }
 
-# Default supervised blocks (package managers, network tools)
-DEFAULT_SUPERVISED_BLOCKS: list[str] = [
-    "/usr/bin/pamac-manager",
-    "/usr/bin/pamac-installer",
-    "/usr/bin/pamac-daemon",
-    "/usr/bin/yay",
-    "/usr/bin/paru",
-    "/usr/bin/flatpak",
-    "/usr/bin/snap",
-    "/usr/bin/docker",
-    "/usr/bin/podman",
-    "/usr/bin/curl",
-    "/usr/bin/wget",
-    "/usr/bin/ssh",
-]
+# Default supervised blocks (package managers, remote access tools).
+# The list depends on the running distribution — see core/distro.py.
+DEFAULT_SUPERVISED_BLOCKS: list[str] = _default_blocks()

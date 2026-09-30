@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    /usr/lib/big-parental-controls/pkg-post-install || true
+fi
+
+#DEBHELPER#
+
+exit 0

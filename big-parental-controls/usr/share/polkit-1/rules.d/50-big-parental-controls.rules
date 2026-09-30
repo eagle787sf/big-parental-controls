@@ -17,6 +17,19 @@ polkit.addRule(function(action, subject) {
                 return polkit.Result.AUTH_ADMIN;
             }
         }
+        // Distro-specific package managers: rpm-ostree (Fedora Atomic, Bazzite),
+        // dnf5daemon (Fedora), snapd (Ubuntu), all PackageKit actions
+        var pkg_prefixes = [
+            "org.projectatomic.rpmostree1.",
+            "org.rpm.dnf.",
+            "io.snapcraft.snapd.",
+            "org.freedesktop.packagekit."
+        ];
+        for (var j = 0; j < pkg_prefixes.length; j++) {
+            if (action.id.indexOf(pkg_prefixes[j]) === 0) {
+                return polkit.Result.AUTH_ADMIN;
+            }
+        }
         // Block user/account management — deny entirely (not even admin auth)
         if (action.id.indexOf("org.freedesktop.accounts") === 0) {
             return polkit.Result.NO;

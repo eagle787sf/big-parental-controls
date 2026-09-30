@@ -20,5 +20,10 @@ if [[ -n "$DEV_SRC" ]]; then
     exec python3 -m big_parental_controls "$@"
 fi
 
-# Installed mode — let Python find the package via its normal sys.path
+# Installed mode — deb/rpm packages ship the Python package in a private
+# directory; the Arch package installs it into site-packages.
+PRIVATE_PY="/usr/lib/big-parental-controls/python"
+if [[ -d "$PRIVATE_PY/big_parental_controls" ]]; then
+    export PYTHONPATH="$PRIVATE_PY${PYTHONPATH:+:$PYTHONPATH}"
+fi
 exec python3 -m big_parental_controls "$@"

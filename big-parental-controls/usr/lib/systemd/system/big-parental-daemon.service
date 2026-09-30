@@ -13,7 +13,9 @@ ProtectSystem=strict
 ReadWritePaths=/var/lib/big-parental-controls
 PrivateTmp=true
 NoNewPrivileges=false
-CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+# CAP_KILL: end sessions / blocked programs of supervised users
+# CAP_SETUID/CAP_SETGID: show notifications on the user's session bus
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_KILL CAP_SETUID CAP_SETGID
 
 [Install]
 WantedBy=multi-user.target
